@@ -10,6 +10,7 @@ Flujo:
 """
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timezone
 
 from config import get_client, get_empresa_activa, get_id_empresa_activa, ALMACEN_POR_PREFIJO
 from utils.ocr_parser import procesar_remito
@@ -43,6 +44,22 @@ def _get_or_create_material(client, codigo_sap: str, descripcion: str, udm: str)
     return nuevo.data[0]["id_material"]
 
 
+def _remitos_ya_cargados(client, id_empresa: int, numeros_documento: set[str]) -> dict[str, str]:
+    """Devuelve {numero_documento: fecha_carga} para los documentos de esa
+    lista que YA existen en remitos_ingresados para esta empresa."""
+    if not numeros_documento:
+        return {}
+    filas = (
+        client.table("remitos_ingresados")
+        .select("numero_documento, fecha_carga")
+        .eq("id_empresa", id_empresa)
+        .in_("numero_documento", list(numeros_documento))
+        .execute()
+        .data
+    )
+    return {f["numero_documento"]: f["fecha_carga"] for f in filas}
+
+
 def _tab_carga_documentos(client, id_empresa: int):
     st.subheader("Carga de remitos / OCR")
     archivo = st.file_uploader("Subí el PDF del remito (M513 / C250 / M250 / P250)", type=["pdf"])
@@ -52,6 +69,12 @@ def _tab_carga_documentos(client, id_empresa: int):
 
     with st.spinner("Extrayendo texto (OCR si es escaneo) y detectando ítems..."):
         resultado = procesar_remito(archivo.read())
+
+    # El texto crudo se muestra SIEMPRE, haya o no ítems detectados — antes
+    # solo aparecía cuando el parseo fallaba del todo, así que si detectaba
+    # ALGO (aunque incompleto) no había forma de ver qué leyó Tesseract.
+    with st.expander("🔍 Texto crudo (debug OCR)", expanded=not resultado.items):
+        st.text(resultado.texto_crudo or "(vacío)")
 
     if not resultado.tipo_almacen:
         st.error(
@@ -67,16 +90,70 @@ def _tab_carga_documentos(client, id_empresa: int):
         st.success(f"Detectado: almacén de **{tipo_almacen}** ({codigo})")
 
     if not resultado.items:
-        st.warning("No se pudieron extraer ítems automáticamente. Revisá el texto crudo abajo.")
-        with st.expander("Texto crudo (debug OCR)"):
-            st.text(resultado.texto_crudo)
+        st.warning("No se pudieron extraer ítems automáticamente. Revisá el texto crudo arriba.")
         return
 
     df_items = pd.DataFrame([i.__dict__ for i in resultado.items])
-    st.write("Ítems detectados (editables antes de confirmar):")
-    df_editada = st.data_editor(df_items, num_rows="dynamic", use_container_width=True)
 
-    if st.button("✅ Confirmar ingreso a stock", type="primary"):
+    # --- Detección de remitos ya cargados (por N° de Documento) ---
+    documentos_en_pdf = set(df_items["numero_documento"].dropna().unique())
+    ya_cargados = _remitos_ya_cargados(client, id_empresa, documentos_en_pdf)
+
+    forzar_recarga = False
+    if ya_cargados:
+        detalle = "\n".join(f"- **{doc}** (cargado el {fecha})" for doc, fecha in ya_cargados.items())
+        st.error(
+            f"🚫 {len(ya_cargados)} de los remitos de este PDF YA fueron cargados antes:\n\n{detalle}\n\n"
+            "Sus ítems NO se muestran en la grilla de abajo para evitar duplicar stock."
+        )
+        forzar_recarga = st.checkbox(
+            "⚠️ Sé que ya se cargaron y quiero incluirlos de todos modos (uso excepcional, ej. corrección)",
+            value=False,
+        )
+
+    if forzar_recarga:
+        df_a_mostrar = df_items
+    else:
+        df_a_mostrar = df_items[~df_items["numero_documento"].isin(ya_cargados.keys())].reset_index(drop=True)
+
+    if df_a_mostrar.empty:
+        st.info("No queda ningún ítem nuevo para cargar de este PDF (todos sus remitos ya estaban cargados).")
+        return
+
+    cantidad_revision = int(df_a_mostrar["necesita_revision"].sum()) if "necesita_revision" in df_a_mostrar else 0
+    if cantidad_revision:
+        st.warning(
+            f"⚠️ {cantidad_revision} ítem(s) quedaron marcados como 'necesita_revision' porque el OCR no pudo "
+            "leer la cantidad con confianza (falta la unidad de medida, o el número quedó en otro renglón del "
+            "escaneo). Corregí la cantidad a mano en la grilla contra el PDF original antes de confirmar."
+        )
+
+    st.write("Ítems detectados (editables antes de confirmar):")
+    df_editada = st.data_editor(
+        df_a_mostrar,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "necesita_revision": st.column_config.CheckboxColumn(
+                "¿Revisar?", help="Marcado automáticamente cuando el OCR no pudo leer la cantidad con confianza."
+            ),
+            "numero_documento": st.column_config.TextColumn(
+                "N° Documento (remito)", help="Identificador del remito — se usa para detectar duplicados."
+            ),
+        },
+    )
+
+    if df_editada["necesita_revision"].any():
+        st.error(
+            "🚫 Todavía hay ítems marcados para revisar con cantidad en blanco/0. Corregilos en la grilla "
+            "(o destildá 'Revisar' si ya confirmaste el valor a ojo) antes de confirmar el ingreso a stock."
+        )
+
+    if st.button(
+        "✅ Confirmar ingreso a stock",
+        type="primary",
+        disabled=bool(df_editada["necesita_revision"].any()),
+    ):
         id_almacen = _get_or_create_almacen(client, id_empresa, tipo_almacen, codigo)
         for _, row in df_editada.iterrows():
             id_material = _get_or_create_material(client, row["catalogo"], row["descripcion"], row["udm"])
@@ -88,6 +165,7 @@ def _tab_carga_documentos(client, id_empresa: int):
                     "tipo_movimiento": "ingreso",
                     "cantidad": row["cantidad"],
                     "elemento_pep": row.get("elemento_pep") or codigo,
+                    "documento_origen": row.get("numero_documento"),
                     "origen_archivo": archivo.name,
                 }
             ).execute()
@@ -104,6 +182,22 @@ def _tab_carga_documentos(client, id_empresa: int):
             client.table("stock_actual").upsert(
                 {"id_almacen": id_almacen, "id_material": id_material, "cantidad": nueva_cantidad}
             ).execute()
+
+        # Marco cada N° de Documento confirmado como ya cargado, para que un
+        # futuro intento de recarga (sin forzar) quede bloqueado por default.
+        documentos_confirmados = set(df_editada["numero_documento"].dropna().unique())
+        for numero_documento in documentos_confirmados:
+            client.table("remitos_ingresados").upsert(
+                {
+                    "id_empresa": id_empresa,
+                    "id_almacen": id_almacen,
+                    "numero_documento": numero_documento,
+                    "origen_archivo": archivo.name,
+                    "fecha_carga": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="id_empresa,numero_documento",
+            ).execute()
+
         st.success(f"{len(df_editada)} ítems ingresados al almacén de {tipo_almacen}.")
 
 
