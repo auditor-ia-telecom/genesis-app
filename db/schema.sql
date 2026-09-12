@@ -127,6 +127,20 @@ create table if not exists movimientos_stock (
 create index if not exists idx_mov_stock_empresa on movimientos_stock(id_empresa);
 create index if not exists idx_mov_stock_pep on movimientos_stock(elemento_pep);
 
+-- Control de remitos ya ingresados: 'Documento' del Vale de Entrega es el
+-- identificador real del remito (constante en todos sus renglones). Antes
+-- de confirmar una carga por OCR se chequea acá para avisar si ese mismo
+-- remito ya fue cargado, en vez de confiar en que la persona se acuerde.
+create table if not exists remitos_ingresados (
+    id_remito        serial primary key,
+    id_empresa       int not null references empresas(id_empresa),
+    id_almacen       int not null references almacenes(id_almacen),
+    numero_documento text not null,
+    origen_archivo   text,
+    fecha_carga      timestamptz default now(),
+    unique (id_empresa, numero_documento)
+);
+
 create table if not exists vales_salida (
     id_vale       serial primary key,
     id_empresa    int not null references empresas(id_empresa),
@@ -370,6 +384,7 @@ alter table almacenes                   disable row level security;
 alter table materiales                  disable row level security;
 alter table stock_actual                disable row level security;
 alter table movimientos_stock           disable row level security;
+alter table remitos_ingresados          disable row level security;
 alter table vales_salida                disable row level security;
 alter table vale_items                  disable row level security;
 alter table despachos_viaticos          disable row level security;
