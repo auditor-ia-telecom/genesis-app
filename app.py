@@ -18,6 +18,7 @@ Roles soportados:
                      facturado) que un pañolero no necesita ver.
 """
 import hmac
+import unicodedata
 
 import streamlit as st
 from config import get_client, get_empresa_activa, EMPRESAS_DISPONIBLES
@@ -54,6 +55,21 @@ MODULOS_POR_ROL = {
 ROLES_VALIDOS = set(MODULOS_POR_ROL.keys())
 
 
+def _normalizar(texto: str) -> str:
+    """Unicode NFC + strip de espacios en los bordes.
+
+    Copiar credenciales entre GitHub (web), esta conversación y la caja de
+    Secrets de Streamlit Cloud puede introducir dos problemas invisibles en
+    pantalla: espacios sueltos al principio/final, y variantes de
+    normalización Unicode de 'ñ'/tildes (la misma letra puede representarse
+    con bytes distintos según por dónde pasó el texto). Ambos hacen que un
+    string que se VE idéntico compare distinto byte a byte. Se normaliza acá
+    tanto lo que escribe el usuario en el login como lo leído de secrets,
+    para que 'dueño' siempre sea 'dueño' sin importar el origen del texto.
+    """
+    return unicodedata.normalize("NFC", texto).strip()
+
+
 # ---------------------------------------------------------------------
 # 0) LOGIN — gate obligatorio, corre antes que cualquier otra cosa
 # ---------------------------------------------------------------------
@@ -74,22 +90,37 @@ def _usuarios_validos() -> dict:
 
 def _validar_credenciales(usuario: str, contrasena: str) -> str | None:
     """Devuelve el ROL si usuario+contraseña son correctos, o None si no.
-    Además valida que el rol declarado en secrets sea uno de los conocidos:
-    un rol mal escrito en el TOML no debe traducirse silenciosamente en
-    'sin restricciones' — se trata como login inválido.
+
+    La búsqueda del usuario y la comparación de rol se hacen sobre versiones
+    normalizadas (ver _normalizar) para tolerar espacios invisibles o
+    variantes de codificación de acentos introducidas al copiar/pegar entre
+    GitHub y Secrets — sin esto, un typo invisible se ve idéntico en pantalla
+    pero rechaza el login igual.
     """
+    usuario_norm = _normalizar(usuario) if usuario else usuario
     usuarios = _usuarios_validos()
-    datos_usuario = usuarios.get(usuario)
+
+    datos_usuario = None
+    for clave_usuario, datos in usuarios.items():
+        if isinstance(clave_usuario, str) and _normalizar(clave_usuario) == usuario_norm:
+            datos_usuario = datos
+            break
+
     if not isinstance(datos_usuario, dict):
         return None
 
     contrasena_esperada = datos_usuario.get("password")
     rol = datos_usuario.get("rol")
 
-    if contrasena_esperada is None or rol not in ROLES_VALIDOS:
+    if isinstance(rol, str):
+        rol = _normalizar(rol)
+    if not isinstance(contrasena_esperada, str) or rol not in ROLES_VALIDOS:
         return None
 
-    if hmac.compare_digest(contrasena, contrasena_esperada):
+    contrasena_norm = _normalizar(contrasena) if contrasena else contrasena
+    contrasena_esperada_norm = _normalizar(contrasena_esperada)
+
+    if hmac.compare_digest(contrasena_norm, contrasena_esperada_norm):
         return rol
     return None
 
