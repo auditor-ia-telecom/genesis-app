@@ -25,7 +25,22 @@ PREFIJO_A_TIPO_ALMACEN = {
 }
 
 RE_ELEMENTO_PEP = re.compile(r"\b([MCP]\d{3})\b")
-RE_CATALOGO = re.compile(r"^\s*(\d{3})\s+(\d{6,})\s+(.+)$")  # Pos / Documento / Catálogo / Descripción...
+# Estructura real observada en los remitos: Pos | Documento | Catálogo | Descripción... | Cantidad | U.M.
+# 'Documento' es el número del propio remito (cambia por remito, y hasta el
+# OCR lo lee distinto entre renglones del mismo documento) — NO sirve como
+# identificador de material. 'Catálogo' sí es el código SAP estable.
+RE_POS_DOC_CATALOGO = re.compile(r"^\s*(\d{3})\s+(\d{6,})\s+(\d{6,})\s+(.+)$")
+
+# Cantidad (+ unidad opcional) al FINAL del renglón, buscada como patrón
+# independiente en vez de asumir siempre "las últimas dos palabras son
+# cantidad+UM": en escaneos reales, Tesseract a veces pierde la unidad
+# (ej. remito real donde leyó "...SERIAL 4" sin el "UN" final). Si se asume
+# rígidamente cantidad+UM y falta la UM, el intento de convertir la palabra
+# anterior a número falla y el ítem se pierde en silencio — exactamente el
+# bug reportado. Con este patrón, la unidad es opcional.
+RE_CANTIDAD_UDM_FINAL = re.compile(
+    r"(?P<cantidad>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*(?P<udm>[A-Za-zÁÉÍÓÚÑáéíóúñ]{1,5})?\s*$"
+)
 
 # Patrones compartidos con modules/tabla_maestra.py para reconocer:
 #   - NPA de Telecom (Nota de Pedido Abierta): prefijo 7600...
@@ -39,11 +54,13 @@ RE_PEDIDO_ARIBA = re.compile(r"\b(7800\d{6,10})\b")
 
 @dataclass
 class ItemRemito:
+    numero_documento: str
     catalogo: str
     descripcion: str
     cantidad: float
     udm: str
     elemento_pep: str | None = None
+    necesita_revision: bool = False  # True si el OCR no permitió separar cantidad con confianza
 
 
 @dataclass
@@ -80,8 +97,20 @@ def detectar_tipo_almacen(texto: str) -> str | None:
 def parsear_items(texto: str) -> list[ItemRemito]:
     """Extrae renglones de ítems del Vale de Entrega. El formato real observado es:
     'Pos  Documento  Catálogo  Descripción ... Elemento PEP  Cantidad  U.M.'
-    Se hace un parseo tolerante línea por línea; ajustar el regex si Telecom
-    cambia el layout del remito.
+
+    Dos garantías deliberadas, por bugs reales encontrados con documentos
+    de producción:
+      1. Se usa el campo 'Catálogo' (código SAP del material) para
+         identificar el material, NUNCA 'Documento' (número del propio
+         remito, que cambia por remito y que el OCR llega a leer distinto
+         entre renglones del mismo documento).
+      2. Un renglón que matchea Pos+Documento+Catálogo NUNCA se descarta en
+         silencio aunque el OCR no haya podido separar cantidad/UM con
+         confianza (por ejemplo, cuando el escaneo perdió la unidad al
+         final). Se agrega igual con necesita_revision=True para que la
+         persona lo vea en la grilla editable de logistica.py y lo corrija
+         a mano contra el PDF original, en vez de que el ítem desaparezca
+         sin ningún aviso.
     """
     items = []
     pep_actual = None
@@ -94,26 +123,38 @@ def parsear_items(texto: str) -> list[ItemRemito]:
         if pep_match:
             pep_actual = pep_match.group(1)
 
-        m = RE_CATALOGO.match(linea)
-        if m:
-            _pos, catalogo, resto = m.groups()
-            # Últimos dos tokens suelen ser Cantidad y U.M.
-            partes = resto.rsplit(maxsplit=2)
-            if len(partes) == 3:
-                descripcion, cantidad_str, udm = partes
-                try:
-                    cantidad = float(cantidad_str.replace(".", "").replace(",", "."))
-                except ValueError:
-                    continue
-                items.append(
-                    ItemRemito(
-                        catalogo=catalogo,
-                        descripcion=descripcion.strip(),
-                        cantidad=cantidad,
-                        udm=udm.strip(),
-                        elemento_pep=pep_actual,
-                    )
-                )
+        m = RE_POS_DOC_CATALOGO.match(linea)
+        if not m:
+            continue
+        _pos, numero_documento, catalogo, resto = m.groups()
+
+        m_cant = RE_CANTIDAD_UDM_FINAL.search(resto)
+        if m_cant:
+            cantidad_str = m_cant.group("cantidad")
+            udm = (m_cant.group("udm") or "").strip()
+            descripcion = resto[: m_cant.start()].strip()
+            try:
+                cantidad = float(cantidad_str.replace(".", "").replace(",", "."))
+                necesita_revision = False
+            except ValueError:
+                cantidad, necesita_revision = 0.0, True
+        else:
+            # No se encontró ningún número al final del renglón: se agrega
+            # igual con cantidad en blanco en vez de perderse el ítem.
+            descripcion = resto.strip()
+            cantidad, udm, necesita_revision = 0.0, "", True
+
+        items.append(
+            ItemRemito(
+                numero_documento=numero_documento,
+                catalogo=catalogo,
+                descripcion=descripcion or "(revisar contra el PDF original)",
+                cantidad=cantidad,
+                udm=udm,
+                elemento_pep=pep_actual,
+                necesita_revision=necesita_revision,
+            )
+        )
     return items
 
 
