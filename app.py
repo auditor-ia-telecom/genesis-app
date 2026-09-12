@@ -88,55 +88,70 @@ def _usuarios_validos() -> dict:
         st.stop()
 
 
-def _validar_credenciales(usuario: str, contrasena: str) -> str | None:
-    """Devuelve el ROL si usuario+contraseña son correctos, o None si no.
+def _validar_credenciales(usuario: str, contrasena: str) -> tuple[str | None, dict]:
+    """Devuelve (rol_o_None, diagnostico).
 
-    La búsqueda del usuario y la comparación de rol se hacen sobre versiones
-    normalizadas (ver _normalizar) para tolerar espacios invisibles o
-    variantes de codificación de acentos introducidas al copiar/pegar entre
-    GitHub y Secrets — sin esto, un typo invisible se ve idéntico en pantalla
-    pero rechaza el login igual.
+    diagnostico es un dict SIN contraseñas en texto plano (solo largos y
+    booleanos) pensado para mostrarse en pantalla durante el debug — más
+    confiable que depender de que algún panel de logs capture un print(),
+    que en este mismo deploy resultó no actualizarse en vivo.
     """
     usuario_norm = _normalizar(usuario) if usuario else usuario
     usuarios = _usuarios_validos()
 
+    clave_encontrada = None
     datos_usuario = None
     for clave_usuario, datos in usuarios.items():
         if isinstance(clave_usuario, str) and _normalizar(clave_usuario) == usuario_norm:
+            clave_encontrada = clave_usuario
             datos_usuario = datos
             break
 
+    diagnostico = {
+        "usuario_tipeado": usuario_norm,
+        "usuarios_disponibles_en_secrets": sorted(str(k) for k in usuarios.keys()),
+        "se_encontro_el_usuario": clave_encontrada is not None,
+        "clave_encontrada_en_secrets": clave_encontrada,
+    }
+
     if not isinstance(datos_usuario, dict):
-        return None
+        diagnostico["motivo"] = "El usuario tipeado no matchea ninguna clave en [auth.usuarios]."
+        return None, diagnostico
 
     contrasena_esperada = datos_usuario.get("password")
     rol = datos_usuario.get("rol")
+    diagnostico["rol_leido_crudo"] = rol
 
     if isinstance(rol, str):
         rol = _normalizar(rol)
+    diagnostico["rol_normalizado"] = rol
+    diagnostico["rol_es_valido"] = rol in ROLES_VALIDOS
+    diagnostico["password_en_secrets_es_texto"] = isinstance(contrasena_esperada, str)
+
     if not isinstance(contrasena_esperada, str) or rol not in ROLES_VALIDOS:
-        return None
+        diagnostico["motivo"] = (
+            "El usuario se encontró, pero 'password' no es texto o 'rol' no es uno de "
+            f"{sorted(ROLES_VALIDOS)}. Revisá que el bloque tenga exactamente "
+            "{ password = \"...\", rol = \"...\" }."
+        )
+        return None, diagnostico
 
     contrasena_norm = _normalizar(contrasena) if contrasena else contrasena
     contrasena_esperada_norm = _normalizar(contrasena_esperada)
 
-    # --- DEBUG TEMPORAL: sacar en cuanto el login funcione ---
-    # Imprime SOLO a los logs privados de Streamlit Cloud (Manage app → Logs,
-    # el panel que solo ve el dueño del deploy). Nunca se muestra en la UI
-    # ni queda en ninguna captura de pantalla que se comparta.
-    print(
-        f"[DEBUG LOGIN] usuario_tipeado={usuario_norm!r} "
-        f"clave_encontrada_en_secrets={clave_usuario!r} "
-        f"largo_contrasena_tipeada={len(contrasena_norm)} "
-        f"largo_contrasena_secrets={len(contrasena_esperada_norm)} "
-        f"coinciden_exacto={contrasena_norm == contrasena_esperada_norm} "
-        f"rol_leido={rol!r}"
-    )
-    # --- FIN DEBUG TEMPORAL ---
+    diagnostico["largo_contrasena_tipeada"] = len(contrasena_norm)
+    diagnostico["largo_contrasena_en_secrets"] = len(contrasena_esperada_norm)
+    diagnostico["coinciden_exacto"] = contrasena_norm == contrasena_esperada_norm
 
-    if hmac.compare_digest(contrasena_norm, contrasena_esperada_norm):
-        return rol
-    return None
+    if hmac.compare_digest(contrasena_norm.encode("utf-8"), contrasena_esperada_norm.encode("utf-8")):
+        diagnostico["motivo"] = "Coincide. Login OK."
+        return rol, diagnostico
+
+    diagnostico["motivo"] = (
+        "El usuario existe y el rol es válido, pero la contraseña tipeada no coincide "
+        "con la de secrets (comparando ya sin espacios de borde ni diferencias de acentos)."
+    )
+    return None, diagnostico
 
 
 def render_login_screen():
@@ -151,7 +166,7 @@ def render_login_screen():
     if not submitted:
         return
 
-    rol = _validar_credenciales(usuario, contrasena) if usuario else None
+    rol, diagnostico = _validar_credenciales(usuario, contrasena) if usuario else (None, {"motivo": "Campo usuario vacío."})
     if rol:
         st.session_state["autenticado"] = True
         st.session_state["usuario_actual"] = usuario
@@ -159,6 +174,15 @@ def render_login_screen():
         st.rerun()
     else:
         st.error("🚫 Usuario o contraseña incorrectos.")
+
+    # --- DEBUG TEMPORAL: sacar este expander en cuanto el login funcione ---
+    # Se muestra directo en pantalla en vez de depender de un panel de logs
+    # externo (en este deploy el panel de Streamlit Cloud no actualizaba en
+    # vivo). No expone ninguna contraseña real: solo largos, booleanos y qué
+    # clave de secrets matcheó.
+    with st.expander("🔧 Diagnóstico técnico (temporal — sacar después)"):
+        st.json(diagnostico)
+    # --- FIN DEBUG TEMPORAL ---
 
 
 def esta_autenticado() -> bool:
