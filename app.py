@@ -19,6 +19,7 @@ Roles soportados:
 """
 import hmac
 import unicodedata
+from collections.abc import Mapping
 
 import streamlit as st
 from config import get_client, get_empresa_activa, EMPRESAS_DISPONIBLES
@@ -114,7 +115,7 @@ def _validar_credenciales(usuario: str, contrasena: str) -> tuple[str | None, di
         "clave_encontrada_en_secrets": clave_encontrada,
     }
 
-    if not isinstance(datos_usuario, dict):
+    if not isinstance(datos_usuario, Mapping):
         diagnostico["motivo"] = "El usuario tipeado no matchea ninguna clave en [auth.usuarios]."
         return None, diagnostico
 
