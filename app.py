@@ -120,6 +120,20 @@ def _validar_credenciales(usuario: str, contrasena: str) -> str | None:
     contrasena_norm = _normalizar(contrasena) if contrasena else contrasena
     contrasena_esperada_norm = _normalizar(contrasena_esperada)
 
+    # --- DEBUG TEMPORAL: sacar en cuanto el login funcione ---
+    # Imprime SOLO a los logs privados de Streamlit Cloud (Manage app → Logs,
+    # el panel que solo ve el dueño del deploy). Nunca se muestra en la UI
+    # ni queda en ninguna captura de pantalla que se comparta.
+    print(
+        f"[DEBUG LOGIN] usuario_tipeado={usuario_norm!r} "
+        f"clave_encontrada_en_secrets={clave_usuario!r} "
+        f"largo_contrasena_tipeada={len(contrasena_norm)} "
+        f"largo_contrasena_secrets={len(contrasena_esperada_norm)} "
+        f"coinciden_exacto={contrasena_norm == contrasena_esperada_norm} "
+        f"rol_leido={rol!r}"
+    )
+    # --- FIN DEBUG TEMPORAL ---
+
     if hmac.compare_digest(contrasena_norm, contrasena_esperada_norm):
         return rol
     return None
