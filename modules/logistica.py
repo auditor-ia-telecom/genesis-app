@@ -10,10 +10,32 @@ Flujo:
 """
 import streamlit as st
 import pandas as pd
+import math
 from datetime import datetime, timezone
 
 from config import get_client, get_empresa_activa, get_id_empresa_activa, ALMACEN_POR_PREFIJO
 from utils.ocr_parser import procesar_remito
+
+
+def _limpio(valor, default=None):
+    """Convierte NaN/None (típico de celdas vacías en st.data_editor) a un
+    valor por defecto ANTES de mandarlo a Supabase.
+
+    Ojo con 'valor or default': falla con NaN porque NaN es "truthy" en
+    Python (nan or x == nan, no x) — por eso NaN se colaba tal cual hasta la
+    llamada HTTP, y json.dumps(allow_nan=False) la rechaza con un
+    ValueError bastante críptico ("Out of range float values...").
+    """
+    if valor is None:
+        return default
+    try:
+        if isinstance(valor, float) and math.isnan(valor):
+            return default
+        if pd.isna(valor):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return valor
 
 
 
@@ -35,6 +57,7 @@ def _get_or_create_almacen(client, id_empresa: int, tipo_almacen: str, codigo: s
 
 
 def _get_or_create_material(client, codigo_sap: str, descripcion: str, udm: str) -> int:
+    descripcion = _limpio(descripcion, "(sin descripción)")
     existente = client.table("materiales").select("id_material").eq("codigo_sap", codigo_sap).execute().data
     if existente:
         return existente[0]["id_material"]
@@ -62,7 +85,12 @@ def _remitos_ya_cargados(client, id_empresa: int, numeros_documento: set[str]) -
 
 def _tab_carga_documentos(client, id_empresa: int):
     st.subheader("Carga de remitos / OCR")
-    archivo = st.file_uploader("Subí el PDF del remito (M513 / C250 / M250 / P250)", type=["pdf"])
+    archivo = st.file_uploader(
+        "Subí el PDF o la foto del remito (M513 / C250 / M250 / P250)",
+        type=["pdf", "jpg", "jpeg", "png"],
+        help="Una foto sacada con el celular funciona, pero el OCR sale mejor cuanto más plana, "
+        "derecha y bien iluminada esté la toma — evitá sombras y perspectiva torcida si podés.",
+    )
 
     if archivo is None:
         return
@@ -143,29 +171,38 @@ def _tab_carga_documentos(client, id_empresa: int):
         },
     )
 
-    if df_editada["necesita_revision"].any():
+    # Filas agregadas a mano con el "+" del data_editor NUNCA pasaron por el
+    # parser, así que 'necesita_revision' no las cubre. Se valida acá aparte,
+    # sobre la grilla ya editada, para no dejar pasar cantidad/catálogo en
+    # blanco (que en pandas es NaN, no None) a la confirmación.
+    columnas_obligatorias = ["catalogo", "cantidad", "udm"]
+    filas_incompletas = df_editada[columnas_obligatorias].isna().any(axis=1)
+
+    if df_editada["necesita_revision"].any() or filas_incompletas.any():
         st.error(
-            "🚫 Todavía hay ítems marcados para revisar con cantidad en blanco/0. Corregilos en la grilla "
-            "(o destildá 'Revisar' si ya confirmaste el valor a ojo) antes de confirmar el ingreso a stock."
+            "🚫 Hay ítems marcados para revisar, o filas con catálogo/cantidad/UM en blanco "
+            "(incluidas filas agregadas a mano). Completalos en la grilla antes de confirmar "
+            "el ingreso a stock."
         )
 
     if st.button(
         "✅ Confirmar ingreso a stock",
         type="primary",
-        disabled=bool(df_editada["necesita_revision"].any()),
+        disabled=bool(df_editada["necesita_revision"].any() or filas_incompletas.any()),
     ):
         id_almacen = _get_or_create_almacen(client, id_empresa, tipo_almacen, codigo)
         for _, row in df_editada.iterrows():
             id_material = _get_or_create_material(client, row["catalogo"], row["descripcion"], row["udm"])
+            cantidad_limpia = _limpio(row["cantidad"], 0)
             client.table("movimientos_stock").insert(
                 {
                     "id_empresa": id_empresa,
                     "id_almacen": id_almacen,
                     "id_material": id_material,
                     "tipo_movimiento": "ingreso",
-                    "cantidad": row["cantidad"],
-                    "elemento_pep": row.get("elemento_pep") or codigo,
-                    "documento_origen": row.get("numero_documento"),
+                    "cantidad": cantidad_limpia,
+                    "elemento_pep": _limpio(row.get("elemento_pep"), codigo),
+                    "documento_origen": _limpio(row.get("numero_documento")),
                     "origen_archivo": archivo.name,
                 }
             ).execute()
@@ -178,7 +215,7 @@ def _tab_carga_documentos(client, id_empresa: int):
                 .execute()
                 .data
             )
-            nueva_cantidad = row["cantidad"] + (actual[0]["cantidad"] if actual else 0)
+            nueva_cantidad = cantidad_limpia + (actual[0]["cantidad"] if actual else 0)
             client.table("stock_actual").upsert(
                 {"id_almacen": id_almacen, "id_material": id_material, "cantidad": nueva_cantidad}
             ).execute()
