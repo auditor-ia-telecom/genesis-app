@@ -80,7 +80,14 @@ def _extraer_texto_pdf(file_bytes: bytes) -> str:
                 texto_total.append(texto)
             else:
                 imagen = page.to_image(resolution=200).original
-                texto_ocr = pytesseract.image_to_string(imagen, lang="spa")
+                # PSM 6 ("bloque uniforme de texto") en vez del modo automático
+                # (PSM 3, default): confirmado con casos reales que cuando la
+                # columna 'Elemento PEP' viene vacía, deja un hueco horizontal
+                # grande antes de Cantidad/U.M., y el modo automático de
+                # Tesseract descarta esa franja aislada de números como si no
+                # fuera texto. PSM 6 la recupera sin perder el resto del
+                # documento (verificado contra remitos reales de C250 y M513).
+                texto_ocr = pytesseract.image_to_string(imagen, lang="spa", config="--psm 6")
                 texto_total.append(texto_ocr)
     return "\n".join(texto_total)
 
@@ -111,9 +118,18 @@ def parsear_items(texto: str) -> list[ItemRemito]:
          persona lo vea en la grilla editable de logistica.py y lo corrija
          a mano contra el PDF original, en vez de que el ítem desaparezca
          sin ningún aviso.
+      3. Dentro de un mismo remito, todos los renglones (003, 005, 007...)
+         DEBEN compartir el mismo N° de Documento que el primero (001) —
+         es el mismo número impreso, repetido. Si el OCR lee un Documento
+         distinto en un renglón intermedio (típicamente un dígito de más
+         mal leído), se lo reemplaza por el del renglón 001 de ese bloque
+         y se marca igual necesita_revision=True, en vez de dejar un
+         documento "fantasma" que nunca va a coincidir con nada en
+         remitos_ingresados.
     """
     items = []
     pep_actual = None
+    documento_bloque = None
     for linea in texto.splitlines():
         linea = linea.strip()
         if not linea:
@@ -126,7 +142,14 @@ def parsear_items(texto: str) -> list[ItemRemito]:
         m = RE_POS_DOC_CATALOGO.match(linea)
         if not m:
             continue
-        _pos, numero_documento, catalogo, resto = m.groups()
+        pos, numero_documento, catalogo, resto = m.groups()
+
+        documento_inconsistente = False
+        if pos == "001":
+            documento_bloque = numero_documento
+        elif documento_bloque is not None and numero_documento != documento_bloque:
+            documento_inconsistente = True
+            numero_documento = documento_bloque  # mejor estimación: el del inicio del bloque
 
         m_cant = RE_CANTIDAD_UDM_FINAL.search(resto)
         if m_cant:
@@ -152,7 +175,7 @@ def parsear_items(texto: str) -> list[ItemRemito]:
                 cantidad=cantidad,
                 udm=udm,
                 elemento_pep=pep_actual,
-                necesita_revision=necesita_revision,
+                necesita_revision=necesita_revision or documento_inconsistente,
             )
         )
     return items
